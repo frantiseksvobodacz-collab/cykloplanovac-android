@@ -1,75 +1,97 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="cs">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <title>Cykloplánovač</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-  <link rel="stylesheet" href="style.css">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Cykloplánovač</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#1565c0">
+    <link rel="icon" type="image/png" href="icons/icon-192.png">
+    <link rel="apple-touch-icon" href="icons/icon-192.png">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <main id="map" aria-label="Mapa cyklotras a plánování trasy"></main>
 
-  <section class="planner" aria-label="Plánování trasy">
-    <div class="planner__header">
-      <div>
-        <div class="planner__eyebrow">CYKLOPLÁNOVAČ</div>
-        <h1>GPS start → kliknutý cíl</h1>
-      </div>
-      <button id="collapseButton" class="icon-button" type="button" title="Sbalit panel">−</button>
-    </div>
+<div class="app-shell">
 
-    <div id="plannerBody" class="planner__body">
-      <div class="point-row">
-        <span class="point-dot point-dot--start"></span>
-        <div><strong>Start</strong><span id="startText">Zjišťuji GPS polohu…</span></div>
-      </div>
-      <div class="point-row">
-        <span class="point-dot point-dot--finish"></span>
-        <div><strong>Cíl</strong><span id="finishText">Klikněte do mapy</span></div>
-      </div>
+    <aside class="planner" id="planner">
 
-      <div class="button-grid">
-        <button id="gpsButton" class="button button--secondary" type="button">Použít GPS</button>
-        <button id="manualStartButton" class="button button--secondary" type="button">Start ručně</button>
-        <button id="routeButton" class="button button--primary button--wide" type="button" disabled>Vypočítat trasu</button>
-        <button id="startNavigationButton" class="button button--navigation button--wide" type="button" disabled>Spustit navigaci</button>
-        <button id="stopNavigationButton" class="button button--danger button--wide" type="button" hidden>Ukončit navigaci</button>
-        <button id="clearButton" class="button button--ghost button--wide" type="button">Nová trasa</button>
-      </div>
-
-      <label class="voice-switch"><input id="voiceEnabled" type="checkbox" checked><span>Hlasové pokyny</span></label>
-      <div id="hint" class="hint">Po získání GPS klikněte do mapy pro určení cíle.</div>
-
-      <div id="result" class="result" hidden>
-        <div><span>Vzdálenost</span><strong id="distanceText">–</strong></div>
-        <div><span>Odhadovaný čas</span><strong id="timeText">–</strong></div>
-      </div>
-
-      <section id="navigationPanel" class="navigation-panel" hidden>
-        <div class="navigation-label">AKTUÁLNÍ POKYN</div>
-        <div class="maneuver">
-          <div id="maneuverIcon" class="maneuver-icon">↑</div>
-          <div><strong id="maneuverDistance">–</strong><span id="maneuverText">Pokračujte po trase</span></div>
+        <div class="planner-header planning-only">
+            <h1>Cykloplánovač</h1>
+            <button id="togglePlannerBtn" class="btn btn-icon" type="button"
+                    aria-expanded="true" aria-controls="plannerBody"
+                    title="Sbalit / rozbalit panel">▾</button>
         </div>
-        <div class="navigation-stats">
-          <div><span>Do cíle</span><strong id="remainingDistance">–</strong></div>
-          <div><span>Čas</span><strong id="remainingTime">–</strong></div>
-          <div><span>Od trasy</span><strong id="offRouteDistance">–</strong></div>
+
+        <div class="planner-body" id="plannerBody">
+
+            <dl class="points planning-only">
+                <div class="point-row">
+                    <dt>Start</dt>
+                    <dd id="startInfo">nenastaven</dd>
+                </div>
+                <div class="point-row">
+                    <dt>Cíl</dt>
+                    <dd id="finishInfo">nenastaven</dd>
+                </div>
+            </dl>
+
+            <div class="btn-grid planning-only">
+                <button id="calcBtn" class="btn btn-primary wide" type="button" disabled>Vypočítat trasu</button>
+                <button id="startNavBtn" class="btn btn-go" type="button" disabled>Spustit navigaci</button>
+                <button id="newRouteBtn" class="btn" type="button">Nová trasa</button>
+            </div>
+
+            <p id="hint" class="hint planning-only"></p>
+
+            <div id="routeSummary" class="route-summary planning-only" hidden>
+                <div>Vzdálenost: <strong id="routeDistance">–</strong></div>
+                <div>Odhadovaný čas: <strong id="routeTime">–</strong></div>
+            </div>
+
+            <section class="nav-card nav-only" aria-label="Aktuální pokyn">
+                <div class="nav-main">
+                    <div id="maneuverIcon" class="nav-icon" aria-hidden="true">↑</div>
+                    <div class="nav-main-text">
+                        <div id="maneuverDistance" class="nav-distance">–</div>
+                        <div id="maneuverText" class="nav-text">Čekám na GPS…</div>
+                    </div>
+                </div>
+                <div class="nav-stats">
+                    <span>Do cíle: <b id="remainingDistance">–</b></span>
+                    <span>Čas: <b id="remainingTime">–</b></span>
+                    <span>Od trasy: <b id="offRouteDistance">–</b></span>
+                    <span>GPS <b id="gpsAccuracy">–</b></span>
+                </div>
+                <div id="navigationStatus" class="nav-status" role="status" aria-live="polite">Navigace běží</div>
+                <button id="stopNavBtn" class="btn btn-stop" type="button" hidden>Ukončit navigaci</button>
+            </section>
+
+            <label class="voice-row">
+                <input type="checkbox" id="voiceToggle" checked>
+                <span>Hlasové pokyny</span>
+            </label>
+
+            <p id="message" class="message planning-only" role="status" aria-live="polite" hidden></p>
+
         </div>
-        <div id="navigationStatus" class="navigation-status">Čekám na GPS…</div>
-      </section>
-    </div>
-  </section>
-  <main class="map-column">
-    <div id="map" aria-label="Mapa cyklotras a navigace"></div>
+    </aside>
 
-  <div id="loading" class="toast">Načítám síť cyklotras…</div>
-  <div id="message" class="toast toast--bottom" hidden></div>
-  </main>
-  </div>
+    <main class="map-wrap">
+        <div id="map"></div>
+    </main>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="app.js"></script>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="app.js"></script>
+<script>
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function (e) { console.warn('Service worker se nezaregistroval', e); });
+    });
+}
+</script>
 </body>
 </html>

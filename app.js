@@ -1,204 +1,1127 @@
-'use strict';
+/* Cykloplánovač – app.js
+   Vanilla JS + Leaflet 1.9.4 + Valhalla (bicycle) + Geolocation + Web Speech + Wake Lock.
 
-const ROUTER_URL = 'https://valhalla1.openstreetmap.de/route';
-const OFF_ROUTE_M = 60;
-const MAX_GPS_ACCURACY_M = 80;
-const REROUTE_COOLDOWN_MS = 20000;
+   Souřadnice:  Leaflet = [lat, lng]   GeoJSON / routeCoordinates = [lng, lat]
+   Valhalla encoded polyline se dekóduje s precision 6. */
 
-const map = L.map('map', { center: [49.1951, 16.6068], zoom: 11, preferCanvas: true });
-const osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom: 19,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-}).addTo(map);
+(function () {
+    'use strict';
 
-const COLORS = { icn:'#d7191c', ncn:'#f57c00', rcn:'#1976d2', lcn:'#2e7d32', mtb:'#7b1fa2', other:'#68737d' };
-const LABELS = { icn:'Mezinárodní', ncn:'Národní', rcn:'Regionální', lcn:'Místní', mtb:'MTB', other:'Ostatní' };
-const $ = s => document.querySelector(s);
-const ui = {
-  loading:$('#loading'), message:$('#message'), start:$('#startText'), finish:$('#finishText'), gps:$('#gpsButton'), manual:$('#manualStartButton'), route:$('#routeButton'), clear:$('#clearButton'),
-  startNav:$('#startNavigationButton'), stopNav:$('#stopNavigationButton'), voice:$('#voiceEnabled'), hint:$('#hint'), result:$('#result'), distance:$('#distanceText'), time:$('#timeText'),
-  navPanel:$('#navigationPanel'), maneuverIcon:$('#maneuverIcon'), maneuverDistance:$('#maneuverDistance'), maneuverText:$('#maneuverText'), remainingDistance:$('#remainingDistance'),
-  remainingTime:$('#remainingTime'), offRouteDistance:$('#offRouteDistance'), navStatus:$('#navigationStatus'), collapse:$('#collapseButton'), body:$('#plannerBody')
-};
+    // ======================================================================
+    // Konstanty
+    // ======================================================================
 
-function cycleStyle(f) {
-  const k = f.properties?.network || 'other';
-  return { color: COLORS[k] || COLORS.other, weight: k === 'icn' ? 5 : k === 'ncn' ? 4 : 3, opacity: .68, lineCap: 'round' };
-}
-function esc(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c])); }
-function popupHtml(f) {
-  const p = f.properties || {}, title = p.name || (p.ref ? `Cyklotrasa ${p.ref}` : 'Cyklotrasa');
-  return `<b>${esc(title)}</b>${p.ref ? `<br>Číslo: ${esc(p.ref)}` : ''}<br>Síť: ${esc(LABELS[p.network] || LABELS.other)}${p.operator ? `<br>Provozovatel: ${esc(p.operator)}` : ''}`;
-}
-const cycleLayer = L.geoJSON(null, { style:cycleStyle, onEachFeature:(f,l) => l.bindPopup(popupHtml(f)) }).addTo(map);
-L.control.layers({ 'OpenStreetMap':osm }, { 'Cyklotrasy':cycleLayer }, { collapsed:true }).addTo(map);
-const legend = L.control({ position:'bottomleft' });
-legend.onAdd = () => {
-  const d = L.DomUtil.create('div','legend');
-  d.innerHTML = '<strong>Cyklotrasy</strong>' + ['icn','ncn','rcn','lcn','mtb'].map(k => `<div><i class="legend-line" style="background:${COLORS[k]}"></i>${LABELS[k]}</div>`).join('');
-  return d;
-};
-legend.addTo(map);
+    const ROUTER_URL = 'https://valhalla1.openstreetmap.de/route';
+    const OFF_ROUTE_THRESHOLD_M = 60;
+    const MAX_GPS_ACCURACY_M = 80;
+    const REROUTE_COOLDOWN_MS = 20000;
+    const ARRIVAL_DISTANCE_M = 35;
+    const ROUTE_TIMEOUT_MS = 20000;
+    const VOICE_THRESHOLDS = [300, 100, 30];
+    const LAT_SCALE = 111320;
+    const NAV_STATUS_DEFAULT = 'Navigace běží';
 
-let startPoint=null, finishPoint=null, startMarker=null, finishMarker=null, accuracyCircle=null, routeLayer=null, currentMarker=null;
-let routeCoords=[], cumulative=[], maneuvers=[], routeDurationS=0, selectMode='finish';
-let navigating=false, watchId=null, lastRerouteAt=0, rerouting=false, wakeLock=null, lastSpokenKey='';
+    const routeColors = {
+        icn: '#d7191c',
+        ncn: '#f57c00',
+        rcn: '#1976d2',
+        lcn: '#2e7d32',
+        mtb: '#7b1fa2',
+        other: '#68737d'
+    };
 
-const coordText = p => `${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}`;
-function icon(color, letter) {
-  return L.divIcon({ className:'', iconSize:[32,32], iconAnchor:[16,16], html:`<div style="width:30px;height:30px;border-radius:50%;display:grid;place-items:center;background:${color};border:3px solid white;color:white;font:700 13px system-ui;box-shadow:0 2px 8px #0007">${letter}</div>` });
-}
-function msg(text, ms=6000) {
-  ui.message.textContent=text; ui.message.hidden=false; clearTimeout(msg.timer); msg.timer=setTimeout(() => ui.message.hidden=true, ms);
-}
-function updateButtons() { ui.route.disabled = !(startPoint && finishPoint) || navigating; }
-function setStart(p, accuracy=null) {
-  startPoint=p;
-  if(startMarker) map.removeLayer(startMarker);
-  if(accuracyCircle) map.removeLayer(accuracyCircle);
-  startMarker=L.marker([p.lat,p.lng],{icon:icon('#1565c0','S')}).addTo(map).bindPopup('Start');
-  if(accuracy) accuracyCircle=L.circle([p.lat,p.lng],{radius:accuracy,color:'#1565c0',weight:1,fillOpacity:.08}).addTo(map);
-  ui.start.textContent=coordText(p); selectMode='finish'; map.getContainer().classList.add('crosshair'); ui.hint.textContent='Klikněte do mapy pro určení cíle.'; updateButtons();
-}
-function setFinish(p) {
-  finishPoint=p;
-  if(finishMarker) map.removeLayer(finishMarker);
-  finishMarker=L.marker([p.lat,p.lng],{icon:icon('#e53935','C')}).addTo(map).bindPopup('Cíl');
-  ui.finish.textContent=coordText(p); map.getContainer().classList.remove('crosshair'); ui.hint.textContent='Start a cíl jsou připraveny. Stiskněte „Vypočítat trasu“.'; updateButtons();
-}
-function locate() {
-  if(!navigator.geolocation) { msg('Prohlížeč nepodporuje geolokaci. Použijte „Start ručně“.'); return; }
-  ui.gps.disabled=true; ui.start.textContent='Zjišťuji GPS polohu…';
-  navigator.geolocation.getCurrentPosition(pos => {
-    const p={lat:pos.coords.latitude,lng:pos.coords.longitude}; setStart(p,pos.coords.accuracy); map.setView([p.lat,p.lng],pos.coords.accuracy<100?16:14); ui.gps.disabled=false; msg(`GPS poloha nalezena, přesnost přibližně ${Math.round(pos.coords.accuracy)} m.`);
-  }, err => {
-    ui.gps.disabled=false; ui.start.textContent='GPS se nepodařilo zjistit';
-    msg(({1:'Přístup k poloze nebyl povolen.',2:'Poloha není dostupná.',3:'Vypršel čas pro GPS.'}[err.code]||'Chyba geolokace.')+' Použijte „Start ručně“.',8000);
-  }, {enableHighAccuracy:true,timeout:12000,maximumAge:30000});
-}
+    const networkLabels = {
+        icn: 'mezinárodní',
+        ncn: 'národní',
+        rcn: 'regionální',
+        lcn: 'místní',
+        mtb: 'MTB',
+        other: 'neurčeno'
+    };
 
-map.on('click', e => {
-  if(navigating) return;
-  const p={lat:e.latlng.lat,lng:e.latlng.lng};
-  if(selectMode==='start') { setStart(p); msg('Ruční start nastaven. Nyní klikněte na cíl.'); } else setFinish(p);
-});
-ui.gps.addEventListener('click',locate);
-ui.manual.addEventListener('click',() => { selectMode='start'; map.getContainer().classList.add('crosshair'); ui.hint.textContent='Klikněte do mapy pro ruční nastavení startu.'; msg('Klikněte do mapy na místo startu.'); });
-ui.route.addEventListener('click',() => calculateRoute(false));
-ui.startNav.addEventListener('click',startNavigation);
-ui.stopNav.addEventListener('click',() => stopNavigation(true));
-ui.clear.addEventListener('click',clearAll);
-ui.collapse.addEventListener('click',() => { ui.body.hidden=!ui.body.hidden; ui.collapse.textContent=ui.body.hidden?'+':'−'; setTimeout(()=>map.invalidateSize(),150); });
+    // ======================================================================
+    // Stav aplikace
+    // ======================================================================
 
-function clearAll() {
-  stopNavigation(false);
-  [startMarker,finishMarker,accuracyCircle,routeLayer,currentMarker].forEach(l => { if(l&&map.hasLayer(l)) map.removeLayer(l); });
-  startPoint=finishPoint=startMarker=finishMarker=accuracyCircle=routeLayer=currentMarker=null; routeCoords=[]; maneuvers=[];
-  ui.start.textContent='Zjišťuji GPS polohu…'; ui.finish.textContent='Klikněte do mapy'; ui.result.hidden=true; ui.startNav.disabled=true; ui.hint.textContent='Po získání GPS klikněte do mapy pro určení cíle.'; updateButtons(); locate();
-}
+    let startPoint = null;
+    let finishPoint = null;
+    let startMarker = null;
+    let finishMarker = null;
+    let routeLayer = null;
+    let currentMarker = null;
+    let routeCoordinates = [];     // [[lng, lat], ...]
+    let routeCumulative = [];      // metry od začátku trasy
+    let maneuvers = [];
+    let navigating = false;
+    let watchId = null;
+    let rerouting = false;
+    let lastRerouteAt = 0;
+    let lastSpokenKey = '';
+    let wakeLock = null;
 
-function decodePolyline(encoded, precision=6) {
-  let i=0,lat=0,lng=0,out=[],factor=10**precision;
-  while(i<encoded.length) {
-    let shift=0,result=0,byte;
-    do { byte=encoded.charCodeAt(i++)-63; result|=(byte&31)<<shift; shift+=5; } while(byte>=32);
-    lat+=(result&1)?~(result>>1):(result>>1); shift=0; result=0;
-    do { byte=encoded.charCodeAt(i++)-63; result|=(byte&31)<<shift; shift+=5; } while(byte>=32);
-    lng+=(result&1)?~(result>>1):(result>>1); out.push([lng/factor,lat/factor]);
-  }
-  return out;
-}
-function parseRoute(data) {
-  if(!data.trip?.legs?.length) throw new Error('Routing server nevrátil úsek trasy.');
-  const coords=[], mans=[];
-  data.trip.legs.forEach(leg => {
-    let c=typeof leg.shape==='string' ? decodePolyline(leg.shape,6) : (leg.shape?.coordinates||leg.shape);
-    if(!Array.isArray(c)||c.length<2) return;
-    const offset=coords.length ? coords.length-1 : 0;
-    if(coords.length) c=c.slice(1);
-    coords.push(...c);
-    (leg.maneuvers||[]).forEach(m => mans.push({...m,globalBegin:(m.begin_shape_index||0)+offset,globalEnd:(m.end_shape_index||0)+offset}));
-  });
-  if(coords.length<2) throw new Error('Geometrii trasy se nepodařilo dekódovat.');
-  return {coords,maneuvers:mans};
-}
+    let accuracyCircle = null;
+    let routeTimeSec = 0;
+    let routeLengthKm = 0;
+    let calculating = false;
+    let locating = false;
+    let routeToken = 0;            // zneplatní rozpracované požadavky
+    let lastSegIndex = null;
+    let lastPosition = null;
+    let firstFix = true;
+    let statusTimer = null;
+    const spokenKeys = new Set();
 
-async function calculateRoute(isReroute=false) {
-  if(!startPoint||!finishPoint) return;
-  if(isReroute) { rerouting=true; ui.navStatus.textContent='Přepočítávám trasu…'; }
-  else { ui.route.disabled=true; ui.route.textContent='Počítám…'; ui.hint.textContent='Routing server vypočítává cyklistickou trasu.'; }
-  const req={locations:[{lat:startPoint.lat,lon:startPoint.lng},{lat:finishPoint.lat,lon:finishPoint.lng}],costing:'bicycle',units:'kilometers',language:'cs-CZ',directions_type:'instructions'};
-  try {
-    const r=await fetch(`${ROUTER_URL}?json=${encodeURIComponent(JSON.stringify(req))}`);
-    if(!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data=await r.json(); if(data.error_code) throw new Error(data.error||`Valhalla chyba ${data.error_code}`);
-    const parsed=parseRoute(data); routeCoords=parsed.coords; maneuvers=parsed.maneuvers; buildMetrics();
-    if(routeLayer&&map.hasLayer(routeLayer)) map.removeLayer(routeLayer);
-    routeLayer=L.geoJSON({type:'Feature',properties:{},geometry:{type:'LineString',coordinates:routeCoords}},{style:{color:'#ff1744',weight:7,opacity:.94,lineCap:'round',lineJoin:'round'}}).addTo(map).bringToFront();
-    const summary=data.trip.summary||data.trip.legs[0].summary||{}; routeDurationS=Number(summary.time||0); const routeM=Number(summary.length||0)*1000;
-    ui.distance.textContent=`${(routeM/1000).toLocaleString('cs-CZ',{maximumFractionDigits:1})} km`; ui.time.textContent=formatTime(routeDurationS); ui.result.hidden=false; ui.startNav.disabled=false;
-    if(isReroute) { lastRerouteAt=Date.now(); lastSpokenKey=''; speak('Trasa byla přepočítána.'); ui.navStatus.textContent='Nová trasa je připravena.'; }
-    else { map.fitBounds(routeLayer.getBounds(),{padding:[35,35]}); ui.hint.textContent='Trasa je připravena. Pro jízdu stiskněte „Spustit navigaci“.'; msg('Cyklistická trasa byla vypočítána.'); }
-  } catch(e) {
-    console.error(e); msg(`Trasu nelze vypočítat: ${e.message}`,9000); if(isReroute) ui.navStatus.textContent='Přepočet se nezdařil, pokračuji po původní trase.';
-  } finally {
-    rerouting=false; ui.route.textContent='Vypočítat trasu'; updateButtons();
-  }
-}
+    // ======================================================================
+    // DOM
+    // ======================================================================
 
-const toLL=c=>({lat:c[1],lng:c[0]});
-function distanceM(a,b) {
-  const R=6371000,p1=a.lat*Math.PI/180,p2=b.lat*Math.PI/180,dp=(b.lat-a.lat)*Math.PI/180,dl=(b.lng-a.lng)*Math.PI/180;
-  const h=Math.sin(dp/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2; return 2*R*Math.atan2(Math.sqrt(h),Math.sqrt(1-h));
-}
-function buildMetrics() { cumulative=[0]; for(let i=1;i<routeCoords.length;i++) cumulative[i]=cumulative[i-1]+distanceM(toLL(routeCoords[i-1]),toLL(routeCoords[i])); }
-function nearestOnRoute(p) {
-  let best={distance:Infinity,index:0,along:0}; const ys=111320,xs=111320*Math.cos(p.lat*Math.PI/180);
-  for(let i=0;i<routeCoords.length-1;i++) {
-    const a=toLL(routeCoords[i]),b=toLL(routeCoords[i+1]),ax=(a.lng-p.lng)*xs,ay=(a.lat-p.lat)*ys,bx=(b.lng-p.lng)*xs,by=(b.lat-p.lat)*ys,dx=bx-ax,dy=by-ay,l2=dx*dx+dy*dy;
-    let t=l2?-(ax*dx+ay*dy)/l2:0; t=Math.max(0,Math.min(1,t)); const d=Math.hypot(ax+t*dx,ay+t*dy);
-    if(d<best.distance) best={distance:d,index:i,along:cumulative[i]+t*(cumulative[i+1]-cumulative[i])};
-  }
-  return best;
-}
+    function byId(id) {
+        return document.getElementById(id);
+    }
 
-async function startNavigation() {
-  if(!routeCoords.length||!finishPoint) return;
-  if(!navigator.geolocation) { msg('Navigace vyžaduje geolokaci.'); return; }
-  navigating=true; document.body.classList.add('navigation-mode'); setTimeout(()=>map.invalidateSize(),150); ui.startNav.hidden=true; ui.stopNav.hidden=false; ui.route.disabled=true; ui.clear.disabled=true; ui.navPanel.hidden=false; ui.hint.textContent='Navigace běží. Telefon ponechte s otevřenou aplikací.'; map.getContainer().classList.remove('crosshair');
-  await requestWakeLock(); speak('Navigace byla spuštěna.');
-  watchId=navigator.geolocation.watchPosition(updateNavigation,gpsError,{enableHighAccuracy:true,maximumAge:1000,timeout:10000});
-}
-function stopNavigation(announce=true) {
-  navigating=false; document.body.classList.remove('navigation-mode'); setTimeout(()=>map.invalidateSize(),150); if(watchId!==null){navigator.geolocation.clearWatch(watchId);watchId=null;} if('speechSynthesis'in window) speechSynthesis.cancel(); releaseWakeLock();
-  ui.startNav.hidden=false; ui.stopNav.hidden=true; ui.clear.disabled=false; ui.navPanel.hidden=true; updateButtons(); if(announce) msg('Navigace byla ukončena.');
-}
-function updateNavigation(pos) {
-  if(!navigating||!routeCoords.length) return;
-  const p={lat:pos.coords.latitude,lng:pos.coords.longitude};
-  if(!currentMarker) currentMarker=L.circleMarker([p.lat,p.lng],{radius:9,color:'#fff',weight:3,fillColor:'#1565c0',fillOpacity:1}).addTo(map); else currentMarker.setLatLng([p.lat,p.lng]);
-  map.panTo([p.lat,p.lng],{animate:true,duration:.5});
-  const n=nearestOnRoute(p), total=cumulative.at(-1), remaining=Math.max(0,total-n.along), ratio=total?remaining/total:0;
-  ui.remainingDistance.textContent=formatDistance(remaining); ui.remainingTime.textContent=formatTime(routeDurationS*ratio); ui.offRouteDistance.textContent=`${Math.round(n.distance)} m`; updateManeuver(n.index,p);
-  const accuracy=pos.coords.accuracy||999; ui.navStatus.textContent=`GPS ±${Math.round(accuracy)} m${n.distance>OFF_ROUTE_M?' · mimo trasu':''}`;
-  if(distanceM(p,finishPoint)<35) { speak('Dorazili jste do cíle.'); msg('Dorazili jste do cíle.',10000); stopNavigation(false); return; }
-  if(n.distance>OFF_ROUTE_M && accuracy<MAX_GPS_ACCURACY_M && !rerouting && Date.now()-lastRerouteAt>REROUTE_COOLDOWN_MS) { startPoint=p; ui.start.textContent=coordText(p); calculateRoute(true); }
-}
-function updateManeuver(routeIndex,p) {
-  if(!maneuvers.length) { ui.maneuverText.textContent='Pokračujte po vyznačené trase'; ui.maneuverDistance.textContent=''; return; }
-  let idx=maneuvers.findIndex(m=>(m.globalBegin??0)>routeIndex); if(idx<0) idx=maneuvers.length-1;
-  const m=maneuvers[idx], target=toLL(routeCoords[Math.min(m.globalBegin??0,routeCoords.length-1)]), d=distanceM(p,target);
-  ui.maneuverText.textContent=m.instruction||m.verbal_pre_transition_instruction||'Pokračujte po trase'; ui.maneuverDistance.textContent=formatDistance(d); ui.maneuverIcon.textContent=symbol(m.type);
-  const threshold=d<=35?30:d<=120?100:d<=350?300:null;
-  if(threshold!==null) { const key=`${idx}-${threshold}`; if(key!==lastSpokenKey) { lastSpokenKey=key; const t=m.verbal_pre_transition_instruction||m.instruction; if(t) speak(d<=35?t:`Za ${Math.round(d/10)*10} metrů. ${t}`); } }
-}
-function symbol(type) { if([4,5,6,14,15,16].includes(type))return'←'; if([8,9,10,18,19,20].includes(type))return'→'; if([24,25,26].includes(type))return'↻'; return'↑'; }
-function gpsError(e){ui.navStatus.textContent=({1:'GPS nebyla povolena.',2:'GPS poloha není dostupná.',3:'Čekání na GPS vypršelo.'}[e.code]||'Chyba GPS.');}
-function speak(text){if(!ui.voice.checked||!('speechSynthesis'in window)||!text)return;speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);u.lang='cs-CZ';u.rate=1;speechSynthesis.speak(u);}
-async function requestWakeLock(){try{if('wakeLock'in navigator)wakeLock=await navigator.wakeLock.request('screen');}catch(e){console.warn('Wake Lock není dostupný:',e);}}
-function releaseWakeLock(){if(wakeLock){wakeLock.release().catch(()=>{});wakeLock=null;}}
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&navigating)requestWakeLock();});
-function formatDistance(m){return m>=1000?`${(m/1000).toLocaleString('cs-CZ',{maximumFractionDigits:1})} km`:`${Math.max(0,Math.round(m/10)*10)} m`;}
-function formatTime(s){const min=Math.max(0,Math.round(s/60)),h=Math.floor(min/60),m=min%60;return h?`${h} h ${m} min`:`${m} min`;}
+    const dom = {
+        planner: byId('planner'),
+        togglePlannerBtn: byId('togglePlannerBtn'),
+        startInfo: byId('startInfo'),
+        finishInfo: byId('finishInfo'),
+        calcBtn: byId('calcBtn'),
+        startNavBtn: byId('startNavBtn'),
+        stopNavBtn: byId('stopNavBtn'),
+        newRouteBtn: byId('newRouteBtn'),
+        voiceToggle: byId('voiceToggle'),
+        hint: byId('hint'),
+        message: byId('message'),
+        routeSummary: byId('routeSummary'),
+        routeDistance: byId('routeDistance'),
+        routeTime: byId('routeTime'),
+        maneuverIcon: byId('maneuverIcon'),
+        maneuverDistance: byId('maneuverDistance'),
+        maneuverText: byId('maneuverText'),
+        remainingDistance: byId('remainingDistance'),
+        remainingTime: byId('remainingTime'),
+        offRouteDistance: byId('offRouteDistance'),
+        gpsAccuracy: byId('gpsAccuracy'),
+        navigationStatus: byId('navigationStatus')
+    };
 
-fetch('data/cyklotrasy.geojson').then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json();}).then(data=>{cycleLayer.addData(data);ui.loading.hidden=true;locate();}).catch(e=>{console.error(e);ui.loading.textContent='Síť cyklotras se nepodařilo načíst.';locate();});
+    // ======================================================================
+    // Pomocné funkce
+    // ======================================================================
+
+    function esc(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function formatDistance(meters) {
+        if (!isFinite(meters)) { return '–'; }
+        if (meters < 1000) {
+            const rounded = meters >= 100 ? Math.round(meters / 10) * 10 : Math.round(meters);
+            return rounded + ' m';
+        }
+        return (meters / 1000).toFixed(1).replace('.', ',') + ' km';
+    }
+
+    function formatDuration(seconds) {
+        if (!isFinite(seconds)) { return '–'; }
+        const minutes = Math.round(seconds / 60);
+        if (minutes < 1) { return '<1 min'; }
+        if (minutes < 60) { return minutes + ' min'; }
+        return Math.floor(minutes / 60) + ' h ' + (minutes % 60) + ' min';
+    }
+
+    function formatPoint(p) {
+        return p.lat.toFixed(5) + ', ' + p.lng.toFixed(5);
+    }
+
+    function haversine(lat1, lng1, lat2, lng2) {
+        const R = 6371008.8;
+        const toRad = Math.PI / 180;
+        const dLat = (lat2 - lat1) * toRad;
+        const dLng = (lng2 - lng1) * toRad;
+        const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) *
+            Math.sin(dLng / 2) * Math.sin(dLng / 2);
+        return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+    }
+
+    function lcfirst(text) {
+        return text.charAt(0).toLowerCase() + text.slice(1);
+    }
+
+    function scheduleInvalidate() {
+        setTimeout(function () {
+            map.invalidateSize();
+        }, 150);
+    }
+
+    // ======================================================================
+    // Zprávy
+    // ======================================================================
+
+    function setMessage(text, isError) {
+        dom.message.textContent = text || '';
+        dom.message.classList.toggle('error', !!isError);
+        dom.message.hidden = !text;
+    }
+
+    function setNavStatus(text, ttlMs) {
+        dom.navigationStatus.textContent = text;
+        if (statusTimer) {
+            clearTimeout(statusTimer);
+            statusTimer = null;
+        }
+        if (ttlMs) {
+            statusTimer = setTimeout(function () {
+                statusTimer = null;
+                dom.navigationStatus.textContent = NAV_STATUS_DEFAULT;
+            }, ttlMs);
+        }
+    }
+
+    // Za jízdy se zprávy ukazují v navigační kartě, jinak v panelu plánování.
+    function notify(text, isError) {
+        if (navigating) {
+            setNavStatus(text, isError ? 8000 : 6000);
+        } else {
+            setMessage(text, isError);
+        }
+    }
+
+    function updateHint() {
+        dom.hint.textContent = !finishPoint
+            ? 'Start je vaše aktuální poloha (GPS). Klepnutím do mapy zvolte cíl.'
+            : 'Vypočítejte trasu, nebo cíl změňte dalším klepnutím do mapy.';
+    }
+
+    function updateButtons() {
+        dom.calcBtn.disabled = !finishPoint || calculating || navigating;
+        dom.startNavBtn.disabled = routeCoordinates.length < 2 || navigating;
+        dom.stopNavBtn.hidden = !navigating;
+        dom.newRouteBtn.disabled = navigating;
+    }
+
+    // ======================================================================
+    // Mapa
+    // ======================================================================
+
+    if (typeof L === 'undefined') {
+        setMessage('Knihovna Leaflet se nenačetla. Zkontrolujte připojení k internetu.', true);
+        return;
+    }
+
+    const map = L.map('map', {
+        center: [49.1951, 16.6068],
+        zoom: 11,
+        preferCanvas: true,
+        zoomControl: false
+    });
+
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    // ---------- Vrstva cyklotras (pouze vizualizace) ----------
+
+    const NETWORK_ORDER = { other: 0, lcn: 1, mtb: 2, rcn: 3, ncn: 4, icn: 5 };
+
+    function networkKey(feature) {
+        const raw = feature && feature.properties && feature.properties.network;
+        const key = String(raw || '').toLowerCase().split(';')[0].trim();
+        return (key && key !== 'other' && Object.prototype.hasOwnProperty.call(routeColors, key)) ? key : 'other';
+    }
+
+    function cycleStyle(feature) {
+        const key = networkKey(feature);
+        return {
+            color: routeColors[key],
+            weight: key === 'icn' ? 5 : (key === 'ncn' ? 4 : 3),
+            opacity: 0.70
+        };
+    }
+
+    function popupHtml(props) {
+        props = props || {};
+        const key = String(props.network || '').toLowerCase().split(';')[0].trim();
+        const title = props.name ? esc(props.name) : 'Cyklotrasa';
+        const rows = [];
+        if (props.ref) { rows.push('Číslo: ' + esc(props.ref)); }
+        if (props.network) {
+            rows.push('Síť: ' + esc(networkLabels[key] || props.network));
+        }
+        if (props.operator) { rows.push('Provozovatel: ' + esc(props.operator)); }
+        return '<div class="route-popup"><strong>' + title + '</strong>' +
+            rows.map(function (r) { return '<div>' + r + '</div>'; }).join('') +
+            '<button type="button" class="popup-btn">Nastavit cíl sem</button></div>';
+    }
+
+    function loadCycleRoutes() {
+        fetch('data/cyklotrasy.geojson')
+            .then(function (response) {
+                if (!response.ok) { throw new Error('HTTP ' + response.status); }
+                return response.json();
+            })
+            .then(function (data) {
+                if (!data || !Array.isArray(data.features)) {
+                    throw new Error('GeoJSON není FeatureCollection');
+                }
+                const sorted = data.features.slice().sort(function (a, b) {
+                    return NETWORK_ORDER[networkKey(a)] - NETWORK_ORDER[networkKey(b)];
+                });
+                const layer = L.geoJSON({ type: 'FeatureCollection', features: sorted }, {
+                    style: cycleStyle,
+                    bubblingMouseEvents: false,
+                    onEachFeature: function (feature, lyr) {
+                        lyr.bindPopup(function () {
+                            return popupHtml(feature.properties);
+                        });
+                    }
+                }).addTo(map);
+                layer.bringToBack();
+                if (routeLayer) { routeLayer.bringToFront(); }
+            })
+            .catch(function (err) {
+                // Vrstva cyklotras je jen doplněk – routing zůstává použitelný.
+                console.error('Cyklotrasy se nepodařilo načíst', err);
+            });
+    }
+
+    // ======================================================================
+    // Markery start / cíl
+    // ======================================================================
+
+    function pinIcon(letter, cls) {
+        return L.divIcon({
+            className: 'pin ' + cls,
+            html: '<span>' + letter + '</span>',
+            iconSize: [30, 30],
+            iconAnchor: [15, 15]
+        });
+    }
+
+    // Nastaví start bez zneplatnění trasy (používá i rerouting).
+    function placeStart(lat, lng, accuracy) {
+        startPoint = { lat: lat, lng: lng };
+
+        if (startMarker) {
+            startMarker.setLatLng([lat, lng]);
+        } else {
+            startMarker = L.marker([lat, lng], { icon: pinIcon('S', 'pin-start'), title: 'Start' }).addTo(map);
+        }
+
+        const hasAccuracy = typeof accuracy === 'number' && isFinite(accuracy);
+        if (hasAccuracy) {
+            if (accuracyCircle) {
+                accuracyCircle.setLatLng([lat, lng]);
+                accuracyCircle.setRadius(accuracy);
+            } else {
+                accuracyCircle = L.circle([lat, lng], {
+                    radius: accuracy,
+                    color: '#1565c0',
+                    weight: 1,
+                    fillColor: '#1565c0',
+                    fillOpacity: 0.12,
+                    interactive: false
+                }).addTo(map);
+            }
+        } else if (accuracyCircle) {
+            map.removeLayer(accuracyCircle);
+            accuracyCircle = null;
+        }
+
+        dom.startInfo.textContent = formatPoint(startPoint) +
+            (hasAccuracy ? ' (GPS ±' + Math.round(accuracy) + ' m)' : ' (GPS)');
+    }
+
+    function setStart(lat, lng, accuracy) {
+        placeStart(lat, lng, accuracy);
+        invalidateRoute();
+        updateHint();
+        updateButtons();
+    }
+
+    function setFinish(lat, lng) {
+        finishPoint = { lat: lat, lng: lng };
+        if (finishMarker) {
+            finishMarker.setLatLng([lat, lng]);
+        } else {
+            finishMarker = L.marker([lat, lng], { icon: pinIcon('C', 'pin-finish'), title: 'Cíl' }).addTo(map);
+        }
+        dom.finishInfo.textContent = formatPoint(finishPoint);
+        invalidateRoute();
+        updateHint();
+        updateButtons();
+    }
+
+    // ======================================================================
+    // GPS start
+    // ======================================================================
+
+    function permissionMessage() {
+        return 'Přístup k poloze nebyl povolen. Povolte polohu v nastavení prohlížeče.';
+    }
+
+    function acquirePosition(maxAgeMs) {
+        return new Promise(function (resolve, reject) {
+            if (!('geolocation' in navigator)) {
+                reject({ code: 2 });
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(function (pos) {
+                resolve(pos.coords);
+            }, reject, {
+                enableHighAccuracy: true,
+                timeout: 12000,
+                maximumAge: maxAgeMs
+            });
+        });
+    }
+
+    // Po otevření aplikace: START = aktuální GPS.
+    function locateStart() {
+        acquirePosition(30000).then(function (c) {
+            if (navigating) { return; }
+            setStart(c.latitude, c.longitude, c.accuracy);
+            map.setView([c.latitude, c.longitude], Math.max(map.getZoom(), 14));
+            setMessage('');
+        }, function (err) {
+            console.error('Geolokace selhala', err);
+            setMessage(err && err.code === 1 ? permissionMessage() : 'Poloha není dostupná.', true);
+        });
+    }
+
+    // ======================================================================
+    // Valhalla – dekódování a parsování
+    // ======================================================================
+
+    // Vrací [[lng, lat], ...] (GeoJSON pořadí).
+    function decodePolyline(encoded, precision) {
+        const factor = Math.pow(10, precision === undefined ? 6 : precision);
+        const coords = [];
+        let index = 0;
+        let lat = 0;
+        let lng = 0;
+
+        while (index < encoded.length) {
+            let byte;
+            let shift = 0;
+            let result = 0;
+
+            do {
+                byte = encoded.charCodeAt(index++) - 63;
+                result |= (byte & 0x1f) << shift;
+                shift += 5;
+            } while (byte >= 0x20 && index < encoded.length);
+            lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+            shift = 0;
+            result = 0;
+            do {
+                byte = encoded.charCodeAt(index++) - 63;
+                result |= (byte & 0x1f) << shift;
+                shift += 5;
+            } while (byte >= 0x20 && index < encoded.length);
+            lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+            coords.push([lng / factor, lat / factor]);
+        }
+        return coords;
+    }
+
+    // Podporuje: encoded polyline, {coordinates: [...]}, přímé pole koordinátů.
+    function shapeToCoords(shape) {
+        let raw;
+        if (typeof shape === 'string') {
+            raw = decodePolyline(shape, 6);
+        } else if (shape && Array.isArray(shape.coordinates)) {
+            raw = shape.coordinates;
+        } else if (Array.isArray(shape)) {
+            raw = shape;
+        } else {
+            throw new Error('Neznámý formát shape');
+        }
+
+        const coords = raw.map(function (p) {
+            if (Array.isArray(p)) { return [Number(p[0]), Number(p[1])]; }              // [lng, lat]
+            if (p && typeof p === 'object') {
+                return [Number(p.lng !== undefined ? p.lng : p.lon), Number(p.lat)];
+            }
+            return [NaN, NaN];
+        });
+
+        coords.forEach(function (p) {
+            if (!isFinite(p[0]) || !isFinite(p[1]) || Math.abs(p[1]) > 90 || Math.abs(p[0]) > 180) {
+                throw new Error('Neplatná souřadnice v trase: ' + p);
+            }
+        });
+        return coords;
+    }
+
+    function maneuverIconFor(type) {
+        if ([4, 5, 6].indexOf(type) !== -1) { return '⚑'; }
+        if ([26, 27].indexOf(type) !== -1) { return '↻'; }
+        if ([3, 13, 14, 15, 16, 19, 21, 24, 38].indexOf(type) !== -1) { return '←'; }
+        if ([2, 9, 10, 11, 12, 18, 20, 23, 37].indexOf(type) !== -1) { return '→'; }
+        return '↑';
+    }
+
+    function isDestination(type) {
+        return type === 4 || type === 5 || type === 6;
+    }
+
+    function parseRoute(data) {
+        const trip = data && data.trip;
+        if (!trip || !Array.isArray(trip.legs) || trip.legs.length === 0) {
+            throw new Error('Neplatná odpověď routingu');
+        }
+
+        const coordinates = [];
+        const parsedManeuvers = [];
+
+        trip.legs.forEach(function (leg) {
+            const legCoords = shapeToCoords(leg.shape);
+            // První bod dalšího legu je shodný s posledním bodem předchozího – nevkládat dvakrát.
+            const offset = coordinates.length > 0 ? coordinates.length - 1 : 0;
+            Array.prototype.push.apply(coordinates, coordinates.length > 0 ? legCoords.slice(1) : legCoords);
+
+            (leg.maneuvers || []).forEach(function (m) {
+                parsedManeuvers.push({
+                    type: m.type,
+                    text: m.instruction || 'Pokračujte',
+                    verbal: m.verbal_pre_transition_instruction || m.instruction || 'Pokračujte',
+                    streets: m.street_names || [],
+                    length: m.length,
+                    time: m.time,
+                    globalBegin: offset + m.begin_shape_index,
+                    globalEnd: offset + m.end_shape_index
+                });
+            });
+        });
+
+        if (coordinates.length < 2) {
+            throw new Error('Trasa neobsahuje dost bodů');
+        }
+
+        let lengthKm;
+        let timeSec;
+        if (trip.summary && isFinite(trip.summary.length) && isFinite(trip.summary.time)) {
+            lengthKm = trip.summary.length;
+            timeSec = trip.summary.time;
+        } else {
+            lengthKm = 0;
+            timeSec = 0;
+            trip.legs.forEach(function (leg) {
+                if (leg.summary) {
+                    lengthKm += Number(leg.summary.length) || 0;
+                    timeSec += Number(leg.summary.time) || 0;
+                }
+            });
+        }
+
+        return {
+            coordinates: coordinates,
+            maneuvers: parsedManeuvers,
+            lengthKm: lengthKm,
+            timeSec: timeSec
+        };
+    }
+
+    function fetchRoute(from, to) {
+        const request = {
+            locations: [
+                { lat: from.lat, lon: from.lng },
+                { lat: to.lat, lon: to.lng }
+            ],
+            costing: 'bicycle',
+            units: 'kilometers',
+            language: 'cs-CZ',
+            directions_type: 'instructions'
+        };
+
+        const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = setTimeout(function () {
+            if (controller) { controller.abort(); }
+        }, ROUTE_TIMEOUT_MS);
+
+        return fetch(
+            ROUTER_URL + '?json=' + encodeURIComponent(JSON.stringify(request)),
+            controller ? { signal: controller.signal } : undefined
+        ).then(function (response) {
+            if (!response.ok) { throw new Error('Routing HTTP ' + response.status); }
+            return response.json();
+        }).then(parseRoute).then(function (route) {
+            clearTimeout(timer);
+            return route;
+        }, function (err) {
+            clearTimeout(timer);
+            throw err;
+        });
+    }
+
+    // ======================================================================
+    // Trasa: kumulativní délka, vykreslení, aplikace výsledku
+    // ======================================================================
+
+    function computeCumulative(coords) {
+        const cumulative = [0];
+        for (let i = 1; i < coords.length; i++) {
+            cumulative.push(cumulative[i - 1] +
+                haversine(coords[i - 1][1], coords[i - 1][0], coords[i][1], coords[i][0]));
+        }
+        return cumulative;
+    }
+
+    function totalRouteDistance() {
+        return routeCumulative.length ? routeCumulative[routeCumulative.length - 1] : 0;
+    }
+
+    function clearRouteLayer() {
+        if (routeLayer) {
+            map.removeLayer(routeLayer);
+            routeLayer = null;
+        }
+    }
+
+    function invalidateRoute() {
+        routeToken++;
+        clearRouteLayer();
+        routeCoordinates = [];
+        routeCumulative = [];
+        maneuvers = [];
+        routeTimeSec = 0;
+        routeLengthKm = 0;
+        lastSegIndex = null;
+        dom.routeSummary.hidden = true;
+        updateButtons();
+    }
+
+    function applyRoute(route, options) {
+        clearRouteLayer();
+
+        routeCoordinates = route.coordinates;
+        routeCumulative = computeCumulative(routeCoordinates);
+        maneuvers = route.maneuvers;
+        routeTimeSec = route.timeSec;
+        routeLengthKm = route.lengthKm;
+        lastSegIndex = null;
+        lastSpokenKey = '';
+        spokenKeys.clear();
+
+        const feature = {
+            type: 'Feature',
+            properties: {},
+            geometry: { type: 'LineString', coordinates: routeCoordinates }   // [lng, lat]
+        };
+
+        routeLayer = L.geoJSON(feature, {
+            interactive: false,
+            style: function () {
+                return {
+                    color: '#ff1744',
+                    weight: 7,
+                    opacity: 0.94,
+                    lineCap: 'round',
+                    lineJoin: 'round'
+                };
+            }
+        }).addTo(map);
+        routeLayer.bringToFront();
+
+        dom.routeDistance.textContent = formatDistance(routeLengthKm * 1000);
+        dom.routeTime.textContent = formatDuration(routeTimeSec);
+        dom.routeSummary.hidden = false;
+
+        if (options && options.fit) {
+            map.fitBounds(routeLayer.getBounds(), { padding: [35, 35] });
+        }
+        updateButtons();
+    }
+
+    // START je vždy aktuální GPS: před výpočtem se poloha obnoví.
+    function calculateRoute() {
+        if (!finishPoint || calculating || navigating) { return; }
+
+        calculating = true;
+        updateButtons();
+        setMessage('Zjišťuji polohu…');
+
+        acquirePosition(5000).then(function (c) {
+            setStart(c.latitude, c.longitude, c.accuracy);
+        }, function (err) {
+            console.error('Geolokace selhala', err);
+            if (!startPoint) { throw err; }       // jinak použij poslední známou GPS polohu
+        }).then(function () {
+            setMessage('Počítám trasu…');
+            const token = ++routeToken;
+            return fetchRoute(startPoint, finishPoint).then(function (route) {
+                if (token !== routeToken) { return; }    // mezitím se změnil cíl
+                applyRoute(route, { fit: true });
+                setMessage('');
+            });
+        }).catch(function (err) {
+            console.error('Routing selhal', err);
+            if (err && typeof err.code === 'number') {
+                setMessage(err.code === 1 ? permissionMessage() : 'Poloha není dostupná.', true);
+            } else {
+                setMessage('Trasu nelze vypočítat.', true);
+            }
+        }).then(function () {
+            calculating = false;
+            updateButtons();
+        });
+    }
+
+    // ======================================================================
+    // Vzdálenost od trasy
+    // ======================================================================
+
+    // position = { lat, lng }. Vrací { distance, index, along } nebo null.
+    function nearestOnRoute(position) {
+        const n = routeCoordinates.length;
+        if (n < 2) { return null; }
+
+        const lat = position.lat;
+        const lng = position.lng;
+        const lngScale = LAT_SCALE * Math.cos(lat * Math.PI / 180);
+
+        function scan(from, to) {
+            let best = null;
+            for (let i = from; i < to; i++) {
+                const a = routeCoordinates[i];
+                const b = routeCoordinates[i + 1];
+                const ax = (a[0] - lng) * lngScale;
+                const ay = (a[1] - lat) * LAT_SCALE;
+                const bx = (b[0] - lng) * lngScale;
+                const by = (b[1] - lat) * LAT_SCALE;
+                const dx = bx - ax;
+                const dy = by - ay;
+                const len2 = dx * dx + dy * dy;
+                let t = len2 > 0 ? -(ax * dx + ay * dy) / len2 : 0;
+                t = Math.max(0, Math.min(1, t));
+                const px = ax + t * dx;
+                const py = ay + t * dy;
+                const d = Math.sqrt(px * px + py * py);
+                if (!best || d < best.distance) {
+                    best = { distance: d, index: i, t: t };
+                }
+            }
+            return best;
+        }
+
+        // Nejdřív okolí posledního známého segmentu (trasa se může sama křížit),
+        // celé prohledání jen když okno nenajde nic blízkého.
+        let best = null;
+        if (lastSegIndex !== null) {
+            const windowBest = scan(Math.max(0, lastSegIndex - 10), Math.min(n - 1, lastSegIndex + 150));
+            if (windowBest && windowBest.distance <= 40) { best = windowBest; }
+        }
+        if (!best) { best = scan(0, n - 1); }
+
+        const segLen = routeCumulative[best.index + 1] - routeCumulative[best.index];
+        return {
+            distance: best.distance,
+            index: best.index,
+            along: routeCumulative[best.index] + best.t * segLen
+        };
+    }
+
+    // ======================================================================
+    // Hlasové pokyny
+    // ======================================================================
+
+    function speak(text) {
+        if (!dom.voiceToggle.checked) { return; }
+        if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') { return; }
+        try {
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'cs-CZ';
+            utterance.rate = 1;
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(utterance);
+        } catch (err) {
+            console.error('Hlasový výstup selhal', err);
+        }
+    }
+
+    function cancelSpeech() {
+        if ('speechSynthesis' in window) {
+            try { window.speechSynthesis.cancel(); } catch (err) { /* ignoruj */ }
+        }
+    }
+
+    function handleVoiceGuidance(idx, distance) {
+        if (idx < 0) { return; }
+        const m = maneuvers[idx];
+        if (isDestination(m.type)) { return; }     // cíl hlásí detekce dosažení cíle
+
+        let level = -1;
+        for (let k = VOICE_THRESHOLDS.length - 1; k >= 0; k--) {
+            if (distance <= VOICE_THRESHOLDS[k]) { level = k; break; }
+        }
+        if (level < 0) { return; }
+
+        const key = idx + '-' + VOICE_THRESHOLDS[level];
+        if (key === lastSpokenKey || spokenKeys.has(key)) { return; }
+
+        // Hrubší prahy označit jako vyslovené, aby je GPS šum nevrátil zpět.
+        for (let k = 0; k <= level; k++) {
+            spokenKeys.add(idx + '-' + VOICE_THRESHOLDS[k]);
+        }
+        lastSpokenKey = key;
+
+        let text = m.verbal;
+        if (!/[.!?]$/.test(text)) { text += '.'; }
+        if (VOICE_THRESHOLDS[level] > 30) {
+            text = 'Za ' + VOICE_THRESHOLDS[level] + ' metrů ' + lcfirst(text);
+        }
+        speak(text);
+    }
+
+    // ======================================================================
+    // Wake Lock
+    // ======================================================================
+
+    function requestWakeLock() {
+        if (!navigating || wakeLock || !('wakeLock' in navigator)) { return; }
+        try {
+            navigator.wakeLock.request('screen').then(function (sentinel) {
+                if (!navigating || wakeLock) {
+                    sentinel.release().catch(function () { /* ignoruj */ });
+                    return;
+                }
+                wakeLock = sentinel;
+                sentinel.addEventListener('release', function () {
+                    if (wakeLock === sentinel) { wakeLock = null; }
+                });
+            }).catch(function (err) {
+                console.warn('Wake Lock odmítnut', err);
+            });
+        } catch (err) {
+            console.warn('Wake Lock nelze použít', err);
+        }
+    }
+
+    function releaseWakeLock() {
+        if (wakeLock) {
+            const sentinel = wakeLock;
+            wakeLock = null;
+            sentinel.release().catch(function () { /* ignoruj */ });
+        }
+    }
+
+    // ======================================================================
+    // Navigace
+    // ======================================================================
+
+    function findNextManeuver(along) {
+        for (let i = 0; i < maneuvers.length; i++) {
+            if (routeCumulative[maneuvers[i].globalBegin] > along + 3) { return i; }
+        }
+        return -1;
+    }
+
+    function updateNavigationPanel(position, near) {
+        const total = totalRouteDistance();
+        const remaining = Math.max(0, total - near.along);
+        const ratio = total > 0 ? remaining / total : 0;
+
+        dom.remainingDistance.textContent = formatDistance(remaining);
+        dom.remainingTime.textContent = formatDuration(routeTimeSec * ratio);
+        dom.offRouteDistance.textContent = formatDistance(near.distance);
+        dom.gpsAccuracy.textContent = (typeof position.accuracy === 'number' && isFinite(position.accuracy))
+            ? '±' + Math.round(position.accuracy) + ' m' : '–';
+
+        const idx = findNextManeuver(near.along);
+        if (idx >= 0) {
+            const m = maneuvers[idx];
+            const distance = routeCumulative[m.globalBegin] - near.along;
+            dom.maneuverIcon.textContent = maneuverIconFor(m.type);
+            dom.maneuverDistance.textContent = formatDistance(distance);
+            dom.maneuverText.textContent = m.text;
+        } else {
+            dom.maneuverIcon.textContent = '↑';
+            dom.maneuverDistance.textContent = formatDistance(remaining);
+            dom.maneuverText.textContent = 'Pokračujte do cíle';
+        }
+
+        if (!statusTimer) {
+            dom.navigationStatus.textContent = near.distance > OFF_ROUTE_THRESHOLD_M
+                ? 'Jste mimo trasu' : NAV_STATUS_DEFAULT;
+        }
+        return idx;
+    }
+
+    function maybeReroute(position, distanceFromRoute) {
+        if (distanceFromRoute <= OFF_ROUTE_THRESHOLD_M) { return; }
+        if (!(position.accuracy < MAX_GPS_ACCURACY_M)) { return; }
+        if (rerouting) { return; }
+        if (Date.now() - lastRerouteAt < REROUTE_COOLDOWN_MS) { return; }
+        if (!finishPoint) { return; }
+
+        rerouting = true;
+        lastRerouteAt = Date.now();
+        const from = { lat: position.lat, lng: position.lng };    // START = aktuální GPS
+        notify('Přepočítávám trasu…');
+
+        fetchRoute(from, finishPoint).then(function (route) {   // CÍL = původní cíl
+            if (!navigating) { return; }
+            placeStart(from.lat, from.lng, null);
+            applyRoute(route, { fit: false });                  // bez fitBounds
+            notify('Trasa byla přepočítána.');
+            speak('Trasa byla přepočítána.');
+            if (lastPosition) {
+                const near = nearestOnRoute(lastPosition);
+                if (near) {
+                    lastSegIndex = near.index;
+                    updateNavigationPanel(lastPosition, near);
+                }
+            }
+        }).catch(function (err) {
+            console.error('Přepočet trasy selhal', err);
+            if (navigating) {
+                notify('Přepočet se nezdařil, pokračuji po původní trase.', true);
+            }
+        }).then(function () {
+            rerouting = false;
+        });
+    }
+
+    function onPosition(pos) {
+        if (!navigating) { return; }
+
+        const c = pos.coords;
+        const position = { lat: c.latitude, lng: c.longitude, accuracy: c.accuracy };
+        lastPosition = position;
+
+        if (currentMarker) {
+            currentMarker.setLatLng([position.lat, position.lng]);
+        }
+
+        if (firstFix) {
+            firstFix = false;
+            map.setView([position.lat, position.lng], Math.max(map.getZoom(), 17));
+        } else {
+            map.panTo([position.lat, position.lng], { animate: true, duration: 0.5 });
+        }
+
+        const near = nearestOnRoute(position);
+        if (!near) { return; }
+        lastSegIndex = near.index;
+
+        const idx = updateNavigationPanel(position, near);
+
+        // Dosažení cíle (musí být skutečně na konci trasy, ne jen blízko startu u okružní trasy)
+        const end = routeCoordinates[routeCoordinates.length - 1];
+        const toFinish = haversine(position.lat, position.lng, end[1], end[0]);
+        const remainingAlong = totalRouteDistance() - near.along;
+        if (toFinish < ARRIVAL_DISTANCE_M && remainingAlong < ARRIVAL_DISTANCE_M * 3) {
+            speak('Dorazili jste do cíle.');
+            stopNavigation();
+            setMessage('Dorazili jste do cíle.');
+            return;
+        }
+
+        handleVoiceGuidance(idx, idx >= 0 ? routeCumulative[maneuvers[idx].globalBegin] - near.along : Infinity);
+        maybeReroute(position, near.distance);
+    }
+
+    function onPositionError(err) {
+        console.error('watchPosition chyba', err);
+        if (err && err.code === 1) {
+            stopNavigation();
+            setMessage('Přístup k poloze nebyl povolen. Použijte Start ručně.', true);
+        } else {
+            notify('Poloha není dostupná.', true);
+        }
+    }
+
+    function stopWatch() {
+        if (watchId !== null) {
+            navigator.geolocation.clearWatch(watchId);
+            watchId = null;
+        }
+    }
+
+    function startWatch() {
+        stopWatch();     // nikdy dva watchery současně
+        watchId = navigator.geolocation.watchPosition(onPosition, onPositionError, {
+            enableHighAccuracy: true,
+            maximumAge: 1000,
+            timeout: 10000
+        });
+    }
+
+    function startNavigation() {
+        if (navigating || routeCoordinates.length < 2) { return; }
+        if (!('geolocation' in navigator)) {
+            setMessage('Poloha není dostupná.', true);
+            return;
+        }
+
+        navigating = true;
+        firstFix = true;
+        lastPosition = null;
+        lastSegIndex = null;
+        lastSpokenKey = '';
+        spokenKeys.clear();
+        setMessage('');
+
+        document.body.classList.add('navigation-mode');
+
+        dom.maneuverIcon.textContent = '↑';
+        dom.maneuverDistance.textContent = '–';
+        dom.maneuverText.textContent = 'Čekám na GPS…';
+        dom.remainingDistance.textContent = formatDistance(totalRouteDistance());
+        dom.remainingTime.textContent = formatDuration(routeTimeSec);
+        dom.offRouteDistance.textContent = '–';
+        dom.gpsAccuracy.textContent = '–';
+        setNavStatus(NAV_STATUS_DEFAULT);
+
+        if (currentMarker) { map.removeLayer(currentMarker); }
+        const origin = routeCoordinates[0];
+        currentMarker = L.circleMarker([origin[1], origin[0]], {
+            radius: 9,
+            color: '#ffffff',
+            weight: 3,
+            fillColor: '#1565c0',
+            fillOpacity: 1,
+            interactive: false
+        }).addTo(map);
+
+        updateButtons();
+        startWatch();
+        requestWakeLock();
+        scheduleInvalidate();
+
+        // Úvodní pokyn; zároveň „odemkne“ SpeechSynthesis na iOS (běží z kliknutí).
+        if (maneuvers.length) { speak(maneuvers[0].verbal); }
+    }
+
+    function stopNavigation() {
+        navigating = false;
+        stopWatch();
+        releaseWakeLock();
+        if (statusTimer) {
+            clearTimeout(statusTimer);
+            statusTimer = null;
+        }
+        if (currentMarker) {
+            map.removeLayer(currentMarker);
+            currentMarker = null;
+        }
+        document.body.classList.remove('navigation-mode');
+        updateButtons();
+        updateHint();
+        scheduleInvalidate();
+    }
+
+    // ======================================================================
+    // Události UI (registrují se jednou)
+    // ======================================================================
+
+    function newRoute() {
+        if (navigating) { return; }
+        invalidateRoute();
+        if (finishMarker) {
+            map.removeLayer(finishMarker);
+            finishMarker = null;
+        }
+        finishPoint = null;
+        dom.finishInfo.textContent = 'nenastaven';
+        setMessage('');
+        updateHint();
+        updateButtons();
+    }
+
+    function bindEvents() {
+        map.on('click', function (e) {
+            if (navigating) { return; }
+            setFinish(e.latlng.lat, e.latlng.lng);
+        });
+
+        map.on('popupopen', function (e) {
+            const root = e.popup.getElement();
+            const btn = root && root.querySelector('.popup-btn');
+            if (!btn) { return; }
+            const ll = e.popup.getLatLng();
+            btn.onclick = function () {
+                if (!navigating) { setFinish(ll.lat, ll.lng); }
+                map.closePopup();
+            };
+        });
+
+        dom.calcBtn.addEventListener('click', calculateRoute);
+
+        dom.startNavBtn.addEventListener('click', startNavigation);
+
+        dom.stopNavBtn.addEventListener('click', function () {
+            cancelSpeech();
+            stopNavigation();
+        });
+
+        dom.newRouteBtn.addEventListener('click', newRoute);
+
+        dom.voiceToggle.addEventListener('change', function () {
+            if (!dom.voiceToggle.checked) { cancelSpeech(); }
+        });
+
+        dom.togglePlannerBtn.addEventListener('click', function () {
+            const collapsed = dom.planner.classList.toggle('collapsed');
+            dom.togglePlannerBtn.textContent = collapsed ? '▸' : '▾';
+            dom.togglePlannerBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+            scheduleInvalidate();
+        });
+
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible' && navigating) {
+                requestWakeLock();
+            }
+        });
+
+        window.addEventListener('orientationchange', scheduleInvalidate);
+    }
+
+    // ======================================================================
+    // Start aplikace
+    // ======================================================================
+
+    if (!('speechSynthesis' in window)) {
+        dom.voiceToggle.checked = false;
+        dom.voiceToggle.disabled = true;
+    }
+
+    bindEvents();
+    updateHint();
+    updateButtons();
+    loadCycleRoutes();
+    locateStart();
+
+    // Ladicí rozhraní: umožňuje otestovat navigaci a rerouting bez reálné jízdy
+    // (viz README.txt).
+    window.cykloDebug = {
+        simulatePosition: function (lat, lng, accuracy) {
+            if (!navigating) { return false; }
+            onPosition({ coords: { latitude: lat, longitude: lng, accuracy: accuracy } });
+            return true;
+        },
+        getState: function () {
+            return {
+                startPoint: startPoint,
+                finishPoint: finishPoint,
+                navigating: navigating,
+                rerouting: rerouting,
+                watchId: watchId,
+                routeCoordinates: routeCoordinates,
+                routeCumulative: routeCumulative,
+                maneuvers: maneuvers
+            };
+        },
+        decodePolyline: decodePolyline,
+        nearestOnRoute: nearestOnRoute
+    };
+})();
